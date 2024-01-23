@@ -273,28 +273,28 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x) # [B, dim]
 
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim) # [B, dim, n_heads, head_dim]
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim) # [B, dim, n_heads, head_dim]
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim) # [B, dim, n_heads, head_dim]
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)    # [B, seq_len, n_kv_heads, head_dim]
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim) # [B, seq_len, n_kv_heads, head_dim]
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim) # [B, seq_len, n_kv_heads, head_dim]
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         self.cache_k = self.cache_k.to(xq) # to device
         self.cache_v = self.cache_v.to(xq) # to device
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk # 替换相应的值，缓存起来
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv # 替换相应的值，缓存起来
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk # 替换相应的值，存起来
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv # 替换相应的值，存起来
 
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+        keys = self.cache_k[:bsz, : start_pos + seqlen] # 从缓存中获取, 注意这里取的是 :start_pos+seqlen, 而上面存的是 start_pos:start_pos + seqlen
+        values = self.cache_v[:bsz, : start_pos + seqlen] # 从缓存中获取
 
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim) [B, seq_len, n_heads, head_dim]
+        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim) [B, seq_len, n_heads, head_dim]
 
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim) [B, n_heads, seq_len,  head_dim]
+        keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim) [B, n_heads, seq_len,  head_dim]
+        values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim) [B, n_heads, seq_len,  head_dim]
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
@@ -345,7 +345,17 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        """
+        Args:
+            x: [B, seq_len, dim]
+        Returns:
+            self.w1(x) [B, seq_len, hidden_dim]
+            F.silu(x) = x * sigmoid(x); 类似gelu 门控单元。 F.silu(self.w1(x)) [B, seq_len, hidden_dim]
+            self.w3(x) [B, seq_len, hidden_dim]
+            F.silu(self.w1(x)) * self.w3(x) 对应元素相乘， [B, seq_len, hidden_dim]
+            self.w2(F.silu(self.w1(x)) * self.w3(x))  [B, seq_len, dim]
+        """
+        return self.w2(F.silu(self.w1(x)) * self.w3(x)) # [B, seq_len, dim]
 
 
 class TransformerBlock(nn.Module):
@@ -411,9 +421,9 @@ class TransformerBlock(nn.Module):
         """
         h = x + self.attention.forward(
             self.attention_norm(x), start_pos, freqs_cis, mask
-        )
-        out = h + self.feed_forward.forward(self.ffn_norm(h))
-        return out
+        ) # [B, seq_len, dim]
+        out = h + self.feed_forward.forward(self.ffn_norm(h)) # [B, seq_len, dim]
+        return out # [B, seq_len, dim]
 
 
 class Transformer(nn.Module):
@@ -473,13 +483,13 @@ class Transformer(nn.Module):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        _bsz, seqlen = tokens.shape # [B, seq_len]
+        _bsz, seqlen = tokens.shape # [B, seq_len] #这里如果加上cache的话，多数情况下 seqlen=1
         h = self.tok_embeddings(tokens) # [B, seq_len, dim]
         self.freqs_cis = self.freqs_cis.to(h.device) #[max_seq_len * 2, dim/n_heads/2] 这应该是个常量，或者说多个头共享一个 RoPE的 \theta^{i} = 10000^{−2i/d}, 至于这里为啥要 max_seq_len * 2 看上面注释
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen] # 取到对应位置初始编码
 
         mask = None
-        if seqlen > 1:
+        if seqlen > 1: # 在加上缓存的情况下， seqlen=1
             mask = torch.full(
                 (seqlen, seqlen), float("-inf"), device=tokens.device
             ) # [seq_len, seq_len]
@@ -496,9 +506,9 @@ class Transformer(nn.Module):
             ]).type_as(h)
 
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
-        h = self.norm(h)
-        output = self.output(h).float()
+            h = layer(h, start_pos, freqs_cis, mask) # [B, seq_len, dim]
+        h = self.norm(h) # [B, seq_len, dim]
+        output = self.output(h).float() # [B, seq_len, vocab_size]
         return output
 
 if __name__ == '__main__':

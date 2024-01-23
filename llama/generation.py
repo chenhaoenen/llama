@@ -175,7 +175,7 @@ class Llama:
         eos_reached = torch.tensor([False] * bsz, device="cuda")
         input_text_mask = tokens != pad_id
         if min_prompt_len == total_len:
-            logits = self.model.forward(tokens, prev_pos) # logits [B, seq_max, dim]
+            logits = self.model.forward(tokens, prev_pos) # logits [B, seq_len, vocab_size]
             token_logprobs = -F.cross_entropy(
                 input=logits.transpose(1, 2),
                 target=tokens,
@@ -188,18 +188,36 @@ class Llama:
             # 传递这个prev_pos 主要是为了告诉cache 从哪个位置开始缓存，刚开始肯定从 position 为 0 的位置开始缓存，
             # 而后面呢，则每轮迭代仅仅从 cur_pos开始缓存，因为前面的已经缓存过了
 
+            """
+            在pre_pos 为0的时候，输入到transformer的是一个句子，也就是第一轮for循环的时候
+            
+            而在第二轮以及后续的for循环过程中，cur_pos - prev_pos = 1 也就是每次输入到transformer的tokens长度为1
+            """
+
+
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             if temperature > 0:
-                probs = torch.softmax(logits[:, -1] / temperature, dim=-1) # logits[:, -1] 表示的是seq_length的最后一个吧，dim 维度 softmax
+                probs = torch.softmax(logits[:, -1] / temperature, dim=-1) # logits[:, -1] 表示的是seq_length的最后的维度的vocab_size， 然后做softmax
                 next_token = sample_top_p(probs, top_p)
             else:
-                next_token = torch.argmax(logits[:, -1], dim=-1)
+                next_token = torch.argmax(logits[:, -1], dim=-1)  # 获取vocab_size 中最大的那个索引 [B, 1]
 
-            next_token = next_token.reshape(-1)
+            next_token = next_token.reshape(-1) # [B]
             # only replace token if prompt has already been generated
-            next_token = torch.where(
+            next_token = torch.where( # 条件语句(java中的三目表达式)  torch.where(a>0,a,b) 满足条件返回a, 不满足条件返回b
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )
+            """
+            # 这里很机智， 因为刚刚上面我还在纠结，为啥循环的时候用 min_prompt_len, 而不用max_prompt_len, 因为我可能想，如果使用max_prompt_len, 可以将长度较短的prompt例子
+            使用pad_id 在sentence 前面补全就行了，为啥非要使用min_prompt_len, 因为如果使用min_prompt_len的话，很多较长的prompt例子，可能被截断，因为长的prompt的generate
+            位置还没到呢。那看看作者怎么操作的呢？
+            巧妙的使用了条件语句， input_text_mask = tokens != pad_id 将input_text_mask转为bool tensor, 
+            相较长度较短的prompt, next_token位置为pad_id, input_text_mask对应的位置为False
+            而相较长度较长的prompt， next_token位置则为真实的token,  input_text_mask对应的位置为True
+            
+            相较较长的prompt 即使生成了next_tokens, 也不使用
+            """
+
             tokens[:, cur_pos] = next_token
             if logprobs:
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
