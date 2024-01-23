@@ -159,23 +159,23 @@ class Llama:
         bsz = len(prompt_tokens)
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
-        min_prompt_len = min(len(t) for t in prompt_tokens)
-        max_prompt_len = max(len(t) for t in prompt_tokens)
+        min_prompt_len = min(len(t) for t in prompt_tokens) # batch 中 prompt 长度最小值
+        max_prompt_len = max(len(t) for t in prompt_tokens) # batch 中 prompt 长度最大值
         assert max_prompt_len <= params.max_seq_len
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
         pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda") # 定义一个架子来填充token [B, total_len]
         for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda") # for 循环向里面填充 token id
         if logprobs:
-            token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
+            token_logprobs = torch.zeros_like(tokens, dtype=torch.float) # 定义一个架子来填充 logit probability
 
         prev_pos = 0
         eos_reached = torch.tensor([False] * bsz, device="cuda")
         input_text_mask = tokens != pad_id
         if min_prompt_len == total_len:
-            logits = self.model.forward(tokens, prev_pos)
+            logits = self.model.forward(tokens, prev_pos) # logits [B, seq_max, dim]
             token_logprobs = -F.cross_entropy(
                 input=logits.transpose(1, 2),
                 target=tokens,
@@ -184,9 +184,13 @@ class Llama:
             )
 
         for cur_pos in range(min_prompt_len, total_len):
+            # 这里为啥要让prev_pos=0传进去，而在第一轮迭代完之后，又将这个prev_pos置为cur_pos， 看了后面的源码才清楚，
+            # 传递这个prev_pos 主要是为了告诉cache 从哪个位置开始缓存，刚开始肯定从 position 为 0 的位置开始缓存，
+            # 而后面呢，则每轮迭代仅仅从 cur_pos开始缓存，因为前面的已经缓存过了
+
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             if temperature > 0:
-                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                probs = torch.softmax(logits[:, -1] / temperature, dim=-1) # logits[:, -1] 表示的是seq_length的最后一个吧，dim 维度 softmax
                 next_token = sample_top_p(probs, top_p)
             else:
                 next_token = torch.argmax(logits[:, -1], dim=-1)
@@ -260,15 +264,15 @@ class Llama:
 
         """
         if max_gen_len is None:
-            max_gen_len = self.model.params.max_seq_len - 1
-        prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+            max_gen_len = self.model.params.max_seq_len - 1 # 模型config中的配置
+        prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts] # tokenize prompts
         generation_tokens, generation_logprobs = self.generate(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
             temperature=temperature,
             top_p=top_p,
-            logprobs=logprobs,
-            echo=echo,
+            logprobs=logprobs, # bool 值，表示是否返回 logits
+            echo=echo, # 是否将prompt token 放在output中
         )
         if logprobs:
             return [

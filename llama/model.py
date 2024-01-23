@@ -97,11 +97,11 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
         
 
     """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)) #[dim/2]
+    t = torch.arange(end, device=freqs.device)  # type: ignore # [end]
+    freqs = torch.outer(t, freqs).float()  # type: ignore # 外积，类似矩阵:end x 1  乘以 矩阵:1 x dim/2  结果为：[end, dim/2]
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64 # out=abs⋅cos(angle)+abs⋅sin(angle)⋅j #[end, dim/2]
+    return freqs_cis #[end, dim/2]
 
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
@@ -240,7 +240,7 @@ class Attention(nn.Module):
                 self.n_local_kv_heads,
                 self.head_dim,
             )
-        ).cuda()
+        ).cuda()  # [B, seq_len, n_heads, head_dim]
         self.cache_v = torch.zeros(
             (
                 args.max_batch_size,
@@ -248,7 +248,7 @@ class Attention(nn.Module):
                 self.n_local_kv_heads,
                 self.head_dim,
             )
-        ).cuda()
+        ).cuda() # [B, seq_len, n_heads, head_dim]
 
     def forward(
         self,
@@ -271,19 +271,19 @@ class Attention(nn.Module):
 
         """
         bsz, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x) # [B, dim]
 
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim) # [B, dim, n_heads, head_dim]
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim) # [B, dim, n_heads, head_dim]
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim) # [B, dim, n_heads, head_dim]
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
+        self.cache_k = self.cache_k.to(xq) # to device
+        self.cache_v = self.cache_v.to(xq) # to device
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk # 替换相应的值，缓存起来
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv # 替换相应的值，缓存起来
 
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
@@ -403,6 +403,12 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
+        """
+        x: [B, seq_len, dim]
+        start_pos = 0
+        freqs_cis: [seq_len * 2, dim/n_num_heads/2]
+        mask: [seq_len, seq_len]
+        """
         h = x + self.attention.forward(
             self.attention_norm(x), start_pos, freqs_cis, mask
         )
@@ -448,6 +454,7 @@ class Transformer(nn.Module):
         )
 
         self.freqs_cis = precompute_freqs_cis(
+            # 乘以 2 的原因
             # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
@@ -466,18 +473,18 @@ class Transformer(nn.Module):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        _bsz, seqlen = tokens.shape # [B, seq_len]
+        h = self.tok_embeddings(tokens) # [B, seq_len, dim]
+        self.freqs_cis = self.freqs_cis.to(h.device) #[max_seq_len * 2, dim/n_heads/2] 这应该是个常量，或者说多个头共享一个 RoPE的 \theta^{i} = 10000^{−2i/d}, 至于这里为啥要 max_seq_len * 2 看上面注释
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen] # 取到对应位置初始编码
 
         mask = None
         if seqlen > 1:
             mask = torch.full(
                 (seqlen, seqlen), float("-inf"), device=tokens.device
-            )
+            ) # [seq_len, seq_len]
 
-            mask = torch.triu(mask, diagonal=1)
+            mask = torch.triu(mask, diagonal=1) # 上三角阵  [seq_len, seq_len]
 
             # When performing key-value caching, we compute the attention scores
             # only for the new sequence. Thus, the matrix of scores is of size
@@ -493,3 +500,8 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h).float()
         return output
+
+if __name__ == '__main__':
+    freqs_cis = precompute_freqs_cis(8, 10)
+    print(freqs_cis)
+    print(freqs_cis.shape)
